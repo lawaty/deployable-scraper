@@ -451,6 +451,14 @@ while ($running) {
         }
     };
 
+    if (!empty($runJobs)) {
+        $hbRes = $client->post('/scraper/heartbeat', ['logs' => readAgentLogTail($stateDir, 100)]);
+        if (!isset($hbRes['status']) || $hbRes['status'] < 200 || $hbRes['status'] >= 300) {
+            $logger->log('Heartbeat failed with status ' . (int) ($hbRes['status'] ?? 0), 'WARN');
+        }
+        $lastHeartbeat = time();
+    }
+
     try {
         $runner = new JobRunner($scraper, $logger, $outputDir);
         $summary = $runner->run($runJobs, false, $heartbeat);

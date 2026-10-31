@@ -17,10 +17,10 @@ class ResultPoster
 
     public function post(array $results, array $logs = []): array
     {
-        return $this->postTo('/scraper/results', $results);
+        return $this->postTo('/scraper/results', $results, $logs);
     }
 
-    private function postTo(string $path, array $results): array
+    private function postTo(string $path, array $results, array $logs = []): array
     {
         $accepted = 0;
         $duplicates = 0;
