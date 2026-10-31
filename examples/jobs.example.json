@@ -1,0 +1,7 @@
+{
+  "jobs": [
+    {"game_id": 1234, "slug": "super-mario-64", "category": "nintendo-64", "expected_title": "Super Mario 64"},
+    {"game_id": 5678, "slug": "the-legend-of-zelda-ocarina-of-time", "category": "nintendo-64", "expected_title": "The Legend of Zelda: Ocarina of Time"},
+    {"slug": "some-game", "url": "https://www.pricecharting.com/game/playstation/some-game"}
+  ]
+}
