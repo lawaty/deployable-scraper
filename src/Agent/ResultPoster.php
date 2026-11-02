@@ -38,7 +38,8 @@ class ResultPoster
             ];
         }
 
-        $chunks = array_chunk($results, 25);
+        // Chunk size must stay synchronized with central's handleResults limit (currently 100) and current server capacity.
+        $chunks = array_chunk($results, 100);
         foreach ($chunks as $chunkIndex => $chunk) {
             if ($fatal) {
                 break;
