@@ -36,7 +36,15 @@ function readAgentLogTail(string $stateDir, int $limit = 100): array
         return [];
     }
 
-    return array_values(array_slice($lines, -max(1, $limit)));
+    $filtered = [];
+    foreach ($lines as $line) {
+        if (preg_match('/\bPOST\s+https?:\/\//', $line)) {
+            continue;
+        }
+        $filtered[] = $line;
+    }
+
+    return array_values(array_slice($filtered, -max(1, $limit)));
 }
 
 function printAgentUsage($stream): void
@@ -329,8 +337,18 @@ if (isset($options['config'])) {
 }
 
 $scraper = new PriceChartingScraperService($logFn, $maxRetries, $interval, $stateDir, $config);
-$client = new CentralClient($central, $serverId, $secret, $logger);
+$centralLogger = new Logger($stateDir . '/logs-central', false);
+$client = new CentralClient($central, $serverId, $secret, $centralLogger);
 $poster = new ResultPoster($client, $logger, $dlqDir);
+
+$applyRemoteSettings = function (array $response) use ($scraper): void {
+    if (isset($response['json']['daily_cap']) && is_numeric($response['json']['daily_cap'])) {
+        $cap = (int) $response['json']['daily_cap'];
+        if ($cap > 0) {
+            $scraper->setDailyCap($cap);
+        }
+    }
+};
 
 $running = true;
 $shutdown = function () use (&$running): void {
@@ -354,8 +372,60 @@ if (isset($options['verify'])) {
     exit(1);
 }
 
+$hbResInitial = $client->post('/scraper/heartbeat', ['logs' => readAgentLogTail($stateDir, 100), 'budget' => $scraper->budgetState()]);
+$applyRemoteSettings($hbResInitial);
+if (isset($hbResInitial['json']['reset_budget']) && $hbResInitial['json']['reset_budget'] === true) {
+    $scraper->resetDailyBudget();
+    $logger->log('Daily cap reset by central', 'INFO');
+}
+
 while ($running) {
+    $budget = $scraper->budgetState();
+    if (!empty($budget['exhausted'])) {
+        $reason = $budget['reason'] ?? 'unknown';
+        $resumeAt = $budget['resume_at'] ?? null;
+        $resumeLabel = $resumeAt === null ? 'unknown' : gmdate('Y-m-d H:i:s', $resumeAt) . ' UTC';
+        $logger->log(sprintf('%s; resets at %s', $reason === 'daily_cap' ? 'Daily cap reached' : 'Request budget paused', $resumeLabel), 'WARN');
+        $hbRes = $client->post('/scraper/heartbeat', ['logs' => readAgentLogTail($stateDir, 100), 'budget' => $scraper->budgetState()]);
+        if (!isset($hbRes['status']) || $hbRes['status'] < 200 || $hbRes['status'] >= 300) {
+            $logger->log('Heartbeat failed with status ' . (int) ($hbRes['status'] ?? 0), 'WARN');
+        }
+        $applyRemoteSettings($hbRes);
+        if (isset($hbRes['json']['reset_budget']) && $hbRes['json']['reset_budget'] === true) {
+            $scraper->resetDailyBudget();
+            $logger->log('Daily cap reset by central', 'INFO');
+        }
+        $budget = $scraper->budgetState();
+        $resumeAt = $budget['resume_at'] ?? null;
+        if (!empty($budget['exhausted'])) {
+            if (isset($options['once'])) {
+                exit(0);
+            }
+            $now = time();
+            if ($resumeAt === null) {
+                sleep($pollInterval);
+                continue;
+            }
+            $wait = (int) $resumeAt - $now;
+            if ($wait < 0) {
+                $wait = 0;
+            }
+            if ($wait > 300) {
+                $wait = 300;
+            }
+            sleep($wait);
+            continue;
+        }
+        // budget no longer exhausted, fall through to normal /next call
+    }
+
     $res = $client->post('/scraper/next', ['logs' => readAgentLogTail($stateDir, 100)]);
+    $applyRemoteSettings($res);
+
+    if (isset($res['json']['reset_budget']) && $res['json']['reset_budget'] === true) {
+        $scraper->resetDailyBudget();
+        $logger->log('Daily cap reset by central', 'INFO');
+    }
 
     if ($res['status'] === 401) {
         $logger->log('Authentication failed', 'ERROR');
@@ -439,22 +509,45 @@ while ($running) {
         $runJobs[] = $j;
     }
 
+    $buildHeartbeatPayload = function (?int $done = null, ?int $total = null, ?array $entry = null) use ($stateDir, $scraper): array {
+        $payload = ['logs' => readAgentLogTail($stateDir, 100), 'budget' => $scraper->budgetState()];
+        if ($done !== null && $total !== null) {
+            $payload['progress'] = [
+                'done' => max(0, $done),
+                'total' => max(0, $total),
+                'current_slug' => (is_array($entry) && isset($entry['slug']) && is_string($entry['slug'])) ? $entry['slug'] : null,
+                'status' => (is_array($entry) && isset($entry['status']) && is_string($entry['status'])) ? $entry['status'] : null,
+            ];
+        }
+        return $payload;
+    };
+
     $lastHeartbeat = time();
-    $heartbeat = function () use (&$lastHeartbeat, $client, $stateDir, $logger): void {
+    $heartbeat = function (int $done, int $total, array $entry) use (&$lastHeartbeat, $client, $stateDir, $logger, $buildHeartbeatPayload, $scraper, $applyRemoteSettings): void {
         if (time() - $lastHeartbeat < 60) {
             return;
         }
         $lastHeartbeat = time();
-        $res = $client->post('/scraper/heartbeat', ['logs' => readAgentLogTail($stateDir, 100)]);
+        $res = $client->post('/scraper/heartbeat', $buildHeartbeatPayload($done, $total, $entry));
         if (!isset($res['status']) || $res['status'] < 200 || $res['status'] >= 300) {
             $logger->log('Heartbeat failed with status ' . (int) ($res['status'] ?? 0), 'WARN');
+        }
+        $applyRemoteSettings($res);
+        if (isset($res['json']['reset_budget']) && $res['json']['reset_budget'] === true) {
+            $scraper->resetDailyBudget();
+            $logger->log('Daily cap reset by central', 'INFO');
         }
     };
 
     if (!empty($runJobs)) {
-        $hbRes = $client->post('/scraper/heartbeat', ['logs' => readAgentLogTail($stateDir, 100)]);
+        $hbRes = $client->post('/scraper/heartbeat', $buildHeartbeatPayload(0, count($runJobs)));
         if (!isset($hbRes['status']) || $hbRes['status'] < 200 || $hbRes['status'] >= 300) {
             $logger->log('Heartbeat failed with status ' . (int) ($hbRes['status'] ?? 0), 'WARN');
+        }
+        $applyRemoteSettings($hbRes);
+        if (isset($hbRes['json']['reset_budget']) && $hbRes['json']['reset_budget'] === true) {
+            $scraper->resetDailyBudget();
+            $logger->log('Daily cap reset by central', 'INFO');
         }
         $lastHeartbeat = time();
     }
@@ -485,7 +578,8 @@ while ($running) {
                 if (!is_array($entry)) {
                     continue;
                 }
-                if (!in_array($entry['status'] ?? null, ['success', 'failed'], true)) {
+                $status = $entry['status'] ?? null;
+                if (!in_array($status, ['success', 'failed', 'skipped'], true)) {
                     continue;
                 }
                 if (!array_key_exists('index', $entry) || !is_int($entry['index']) && !ctype_digit((string) $entry['index'])) {
@@ -502,20 +596,27 @@ while ($running) {
                     $attempt = 1;
                 }
                 $doc = null;
-                if (isset($entry['path']) && is_string($entry['path']) && $entry['path'] !== '') {
-                    if (is_readable($entry['path'])) {
-                        $docRaw = @file_get_contents($entry['path']);
-                        if ($docRaw !== false) {
-                            $doc = json_decode($docRaw, true);
+                if ($status === 'skipped') {
+                    $doc = [
+                        'status' => 'skipped',
+                        'error' => $entry['error'] ?? 'skipped',
+                    ];
+                } else {
+                    if (isset($entry['path']) && is_string($entry['path']) && $entry['path'] !== '') {
+                        if (is_readable($entry['path'])) {
+                            $docRaw = @file_get_contents($entry['path']);
+                            if ($docRaw !== false) {
+                                $doc = json_decode($docRaw, true);
+                            }
                         }
                     }
-                }
-                if (!is_array($doc)) {
-                    $doc = [
-                        'status' => $entry['status'] ?? 'failed',
-                        'error' => $entry['error'] ?? 'result file missing',
-                        'recent_sales' => [],
-                    ];
+                    if (!is_array($doc)) {
+                        $doc = [
+                            'status' => $entry['status'] ?? 'failed',
+                            'error' => $entry['error'] ?? 'result file missing',
+                            'recent_sales' => [],
+                        ];
+                    }
                 }
                 $results[] = [
                     'job_id' => $jobId,

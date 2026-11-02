@@ -69,6 +69,14 @@ class PriceChartingScraperService
         $this->globalLockFile = $this->stateDir . '/pricecharting-request.lock';
         $this->rawHtmlDir = $this->stateDir . '/anomalies';
         $this->config = array_merge(self::DEFAULT_CONFIG, $config ?? $this->loadConfigFile());
+        try {
+            $dailyCapOverride = $this->state()->get('daily_cap_override');
+            if (is_numeric($dailyCapOverride) && (int) $dailyCapOverride > 0) {
+                $this->config['max_requests_per_day'] = (int) $dailyCapOverride;
+            }
+        } catch (\Throwable $e) {
+            // Fall back to the configured default if the state store is unavailable.
+        }
         $this->requestInterval = max(0.5, $requestInterval ?? (float) $this->config['request_interval_seconds']);
         $this->initCookieJar();
     }
@@ -486,6 +494,35 @@ class PriceChartingScraperService
             $this->state()->incr($key, 1, 90000);   // ~25h TTL covers the UTC day
         } catch (\Throwable $e) {
             $this->log('State store increment failed for ' . $key . ': ' . $e->getMessage(), 'WARNING');
+        }
+    }
+
+    public function resetDailyBudget(): void
+    {
+        try {
+            $key = 'requests_' . gmdate('Ymd');
+            $this->state()->delete($key);
+            $this->log('Daily cap reset by central', 'INFO');
+        } catch (\Throwable $e) {
+            $this->log('Daily cap reset failed: ' . $e->getMessage(), 'ERROR');
+        }
+    }
+
+    /**
+     * Apply the central per-server daily cap and persist it for future runs.
+     */
+    public function setDailyCap(int $dailyCap): void
+    {
+        if ($dailyCap < 1 || (int) $this->config['max_requests_per_day'] === $dailyCap) {
+            return;
+        }
+
+        $this->config['max_requests_per_day'] = $dailyCap;
+        try {
+            $this->state()->set('daily_cap_override', $dailyCap);
+            $this->log('Daily cap set to ' . $dailyCap . ' by central', 'INFO');
+        } catch (\Throwable $e) {
+            $this->log('Daily cap persistence failed: ' . $e->getMessage(), 'ERROR');
         }
     }
 
