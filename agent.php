@@ -579,7 +579,7 @@ while ($running) {
                     continue;
                 }
                 $status = $entry['status'] ?? null;
-                if (!in_array($status, ['success', 'failed', 'skipped'], true)) {
+                if (!in_array($status, ['success', 'failed', 'skipped', 'dead'], true)) {
                     continue;
                 }
                 if (!array_key_exists('index', $entry) || !is_int($entry['index']) && !ctype_digit((string) $entry['index'])) {

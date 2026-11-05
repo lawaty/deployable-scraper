@@ -140,13 +140,33 @@ class PriceChartingScraperService
             $resp = $this->fetchUrl($url);
             $lastStatus = $resp['status'];
 
+            if (!empty($resp['search_products_redirect'])) {
+                $this->log(sprintf('Slug %s is being marked dead because the slug was not found on PriceCharting (search-products redirect)', $slug), 'WARNING');
+                return [
+                    'error' => 'slug not found on PriceCharting (search-products redirect)',
+                    'slug' => $slug,
+                    'http_status' => $resp['status'],
+                    'http_attempts' => $attempts,
+                    'blocked' => false,
+                    'dead' => true,
+                    'scrapes_total' => 1,
+                    'scrapes_successful' => 0,
+                ];
+            }
+
             if ($resp['status'] === 200 && $resp['body'] !== null) {
                 $html = $resp['body'];
                 $this->consecutiveBlocks = 0;
                 break;
             }
 
-            if ($resp['status'] === 403 || $resp['status'] === 429) {
+            if ($resp['status'] === 403) {
+                $blocked = true;
+                $this->log('HTTP 403 is page-specific and does not increment the global block breaker', 'WARNING');
+                break;
+            }
+
+            if ($resp['status'] === 429) {
                 $blocked = true;
                 $this->recordBlockedResponse($resp['status'], $resp['retry_after']);
                 break;
@@ -217,30 +237,108 @@ class PriceChartingScraperService
         return $response;
     }
 
+    private function extractLocationHeader(array $headers): ?string
+    {
+        foreach ($headers as $line) {
+            if (preg_match('/^location:\s*(.+)$/i', trim($line), $m)) {
+                return trim($m[1]);
+            }
+        }
+        return null;
+    }
+
+    private function resolveRedirectUrl(string $location, string $currentUrl): string
+    {
+        if (preg_match('#^https?://#i', $location)) {
+            return $location;
+        }
+        if (strpos($location, '//') === 0) {
+            $parts = parse_url($currentUrl);
+            $scheme = $parts['scheme'] ?? 'https';
+            return $scheme . ':' . $location;
+        }
+        $parts = parse_url($currentUrl);
+        if (!$parts) {
+            return $location;
+        }
+        $scheme = $parts['scheme'] ?? 'https';
+        $host = $parts['host'] ?? '';
+        $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+        $base = $scheme . '://' . $host . $port;
+        if (strpos($location, '/') === 0) {
+            return $base . $location;
+        }
+        $path = $parts['path'] ?? '/';
+        $dir = strrpos($path, '/') !== false ? substr($path, 0, strrpos($path, '/') + 1) : '/';
+        return $base . $dir . $location;
+    }
+
     /** The real HTTP call — protected seam; tests override, zero network. */
     protected function executeRequest(string $url): array
     {
-        $this->lastResponseHeaders = [];
-        $ch = curl_init();
-        $headers = $this->buildRequestHeaders();
-        curl_setopt_array($ch, $this->buildCurlOptions($url, $headers));
-        $start = microtime(true);
-        $html = curl_exec($ch);
-        $elapsed = microtime(true) - $start;
-        $errno = curl_errno($ch);
-        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
+        $currentUrl = $url;
+        $maxHops = 3;
+        $hops = 0;
 
-        if ($errno !== 0) {
-            $this->log(sprintf('cURL error %d for %s (%.2fs)', $errno, $url, $elapsed), 'ERROR');
-            return ['status' => 0, 'body' => null, 'errno' => $errno, 'retry_after' => null];
+        while (true) {
+            $this->lastResponseHeaders = [];
+            $ch = curl_init();
+            $headers = $this->buildRequestHeaders();
+            $curlOptions = $this->buildCurlOptions($currentUrl, $headers);
+            $curlOptions[CURLOPT_FOLLOWLOCATION] = false;
+            curl_setopt_array($ch, $curlOptions);
+            $start = microtime(true);
+            $html = curl_exec($ch);
+            $elapsed = microtime(true) - $start;
+            $errno = curl_errno($ch);
+            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($errno !== 0) {
+                $this->log(sprintf('cURL error %d for %s (%.2fs)', $errno, $currentUrl, $elapsed), 'ERROR');
+                return ['status' => 0, 'body' => null, 'errno' => $errno, 'retry_after' => null];
+            }
+
+            $retryAfter = $this->parseRetryAfter($this->lastResponseHeaders);
+
+            $this->debug(sprintf('HTTP %d in %.2fs for %s', $httpCode, $elapsed, $currentUrl));
+
+            if ($httpCode >= 300 && $httpCode < 400) {
+                $location = $this->extractLocationHeader($this->lastResponseHeaders);
+                if ($location !== null && stripos($location, 'search-products') !== false) {
+                    $this->log(sprintf('Game URL redirected to search-products and no redirect was followed: %s -> %s', $currentUrl, $location), 'WARNING');
+                    return [
+                        'status' => $httpCode,
+                        'body' => null,
+                        'errno' => 0,
+                        'retry_after' => $this->parseRetryAfter($this->lastResponseHeaders),
+                        'search_products_redirect' => true,
+                        'redirect_location' => $location,
+                    ];
+                }
+                if ($location === null || $hops >= $maxHops) {
+                    if ($httpCode !== 200) {
+                        $this->log("Non-200 response ({$httpCode}) for {$currentUrl}", 'WARNING');
+                    }
+                    return [
+                        'status' => $httpCode,
+                        'body' => null,
+                        'errno' => 0,
+                        'retry_after' => $retryAfter,
+                    ];
+                }
+                $nextUrl = $this->resolveRedirectUrl($location, $currentUrl);
+                $currentUrl = $nextUrl;
+                $hops++;
+                continue;
+            }
+
+            if ($httpCode !== 200) {
+                $this->log("Non-200 response ({$httpCode}) for {$currentUrl}", 'WARNING');
+            }
+            return ['status' => $httpCode, 'body' => $httpCode === 200 ? $html : null,
+                'errno' => 0, 'retry_after' => $retryAfter];
         }
-        $this->debug(sprintf('HTTP %d in %.2fs for %s', $httpCode, $elapsed, $url));
-        if ($httpCode !== 200) {
-            $this->log("Non-200 response ({$httpCode}) for {$url}", 'WARNING');
-        }
-        return ['status' => $httpCode, 'body' => $httpCode === 200 ? $html : null,
-            'errno' => 0, 'retry_after' => $this->parseRetryAfter($this->lastResponseHeaders)];
     }
 
     /**
@@ -360,7 +458,7 @@ class PriceChartingScraperService
     }
 
     // ==========================================
-    // Persistent 403/429 block breaker
+    // Persistent 429 rate-limit block breaker
     // ==========================================
 
     private function recordBlockedResponse(int $status, ?int $retryAfter): void

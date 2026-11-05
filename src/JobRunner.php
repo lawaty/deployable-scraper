@@ -128,6 +128,9 @@ final class JobRunner
             }
 
             $isSuccess = !isset($res['error']);
+            $isDead = !empty($res['dead']);
+
+            $docStatus = $isSuccess ? 'success' : ($isDead ? 'dead' : 'failed');
 
             $doc = [
                 'schema_version' => 1,
@@ -141,7 +144,7 @@ final class JobRunner
                     'expected_title' => $expectedTitle,
                     'url' => $docUrl,
                 ],
-                'status' => $isSuccess ? 'success' : 'failed',
+                'status' => $docStatus,
                 'error' => $isSuccess ? null : ($res['error'] ?? 'unknown error'),
                 'http_status' => $res['http_status'] ?? 0,
                 'http_attempts' => $res['http_attempts'] ?? 0,
@@ -163,6 +166,9 @@ final class JobRunner
             if ($isSuccess) {
                 $success++;
                 $this->logger->log(sprintf('[%d/%d] OK %s (recent_sales=%d)', $i + 1, $total, $slug, count($res['recent_sales'] ?? [])));
+            } elseif ($isDead) {
+                $failed++;
+                $this->logger->log(sprintf('[%d/%d] [DEAD] %s: %s', $i + 1, $total, $slug, $res['error'] ?? 'unknown'));
             } else {
                 $failed++;
                 $this->logger->log(sprintf('[%d/%d] FAIL %s: %s', $i + 1, $total, $slug, $res['error'] ?? 'unknown'));
@@ -176,7 +182,7 @@ final class JobRunner
                 'slug' => $slug,
                 'category' => $category,
                 'url' => $docUrl,
-                'status' => $isSuccess ? 'success' : 'failed',
+                'status' => $isSuccess ? 'success' : ($isDead ? 'dead' : 'failed'),
                 'error' => $isSuccess ? null : ($res['error'] ?? null),
                 'http_status' => $res['http_status'] ?? 0,
                 'http_attempts' => $res['http_attempts'] ?? 0,
